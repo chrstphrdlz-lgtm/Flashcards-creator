@@ -274,9 +274,15 @@ def calibrate_bands(flelex: dict, lexique: dict, off_list_floor: str = "B2") -> 
         ),
         "off_list_floor": off_list_floor,
         "off_list_floor_note": (
-            "Words absent from FLELex are outside the standard FFL curriculum, "
-            "so their estimated level is never reported below this floor."
+            "Words absent from FLELex are usually outside the standard FFL "
+            "curriculum, so their estimated level is not reported below this "
+            "floor -- unless they are common enough that FLELex is simply "
+            "missing them, which off_list_floor_max_freq decides."
         ),
+        # Above this many occurrences per million, the calibration bins put
+        # A1-B1 at 76%+ of FLELex words, so an off-list word here is far more
+        # likely omitted basic vocabulary than advanced vocabulary.
+        "off_list_floor_max_freq": 30.0,
         "medians": {lv: round(statistics.median(v), 2)
                     for lv, v in per_level.items() if v},
         "sample_sizes": {lv: len(v) for lv, v in per_level.items()},

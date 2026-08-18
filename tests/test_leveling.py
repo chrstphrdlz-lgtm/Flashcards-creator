@@ -68,6 +68,32 @@ def test_off_list_words_are_never_reported_below_the_floor():
 
 
 @requires_data
+def test_very_common_off_list_words_are_not_forced_up_to_the_floor():
+    """The floor assumes off-list means advanced. Frequency can outvote it.
+
+    `fois` (1140 per million) and `mois` (305) are absent from FLELex, and the
+    floor used to push them to B2 -- injecting elementary vocabulary into an
+    advanced deck. Caught by triage flagging them as "too basic".
+    """
+    for lemma in ("fois", "mois"):
+        result = leveling.level_for(lemma, "NOUN")
+        assert result.source == "freq_estimate"
+        assert not at_or_above(result.level, "B2"), (
+            f"{lemma} ({result.modern_freq}/M) should not be B2 or above")
+
+
+@requires_data
+def test_rare_off_list_words_still_get_the_floor():
+    # The floor still does its job for words that are actually rare.
+    from flashcards_creator import lexicon
+    floor = lexicon.freq_bands().get("off_list_floor", "B2")
+    for lemma in ("basoche", "apothicaire"):
+        result = leveling.level_for(lemma, "NOUN")
+        if result.source == "freq_estimate":
+            assert at_or_above(result.level, floor)
+
+
+@requires_data
 def test_tier4_reports_unknown_for_words_in_neither_lexicon():
     result = leveling.level_for("zzzqxnotaword", "NOUN")
     assert result.level == UNKNOWN

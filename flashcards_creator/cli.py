@@ -17,11 +17,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 from . import (artifacts, audio, config, deck, glosses, ingest, leveling,
-               lexicon, llm, nlp, paths, store)
+               lexicon, llm, nlp, paths, store, triage)
 
 
 def _fail(message: str) -> int:
@@ -125,44 +126,72 @@ def cmd_extract(args, cfg) -> int:
     title, chapters = ingest.read_chapters(Path(epub))
     chapter = ingest.select_chapter(chapters, args.chapter)
     book = args.book or cfg.get("book") or title
-    out_dir = paths.chapter_dir(_book_slug(book), chapter.chapter_id)
-
-    artifacts.guard_overwrite(out_dir, "words", args.force)
 
     print(f"{book} — {chapter.label}")
     print(f"  {len(chapter.paragraphs)} paragraphs, "
           f"{sum(len(p) for p in chapter.paragraphs):,} characters")
 
-    artifacts.write(out_dir, "paragraphs", {
-        "book": book,
-        "chapter_id": chapter.chapter_id,
-        "chapter_index": chapter.index,
-        "chapter_number": chapter.number,
-        "chapter_title": chapter.title,
-        "part": chapter.part,
-        "part_title": chapter.part_title,
-        "label": chapter.label,
-        "incipit": chapter.incipit(),
-        "paragraphs": [
-            {"index": i, "text": text}
-            for i, text in enumerate(chapter.paragraphs, start=1)
-        ],
-    })
+    # A chapter can be far too long to review in one sitting -- this book
+    # ranges from 1.2k to 68k characters -- so --split-at breaks one into
+    # several review-sized parts, each behaving as its own chapter downstream.
+    batches = ingest.split_paragraphs(chapter, args.split_at)
+    known_forms = lexicon.known_forms()
+    total_parts = len(batches)
 
-    print("  tagging with spaCy…")
-    candidates = nlp.extract_candidates(
-        chapter.paragraphs, known_forms=lexicon.known_forms())
-    rows = [c.to_dict() for c in candidates]
+    for part, paragraphs in enumerate(batches, start=1):
+        chapter_id = (chapter.chapter_id if total_parts == 1
+                      else f"{chapter.chapter_id}p{part}")
+        label = (chapter.label if total_parts == 1
+                 else f"{chapter.label} (part {part} of {total_parts})")
+        out_dir = paths.chapter_dir(_book_slug(book), chapter_id)
+        artifacts.guard_overwrite(out_dir, "words", args.force)
 
-    artifacts.write(out_dir, "words", {
-        "book": book,
-        "chapter_id": chapter.chapter_id,
-        "label": chapter.label,
-        "words": rows,
-    })
-    print(f"  {len(rows)} distinct (lemma, part of speech) candidates")
-    print(f"\nwrote {out_dir}/words.json\nnext: fcc level --chapter {args.chapter}")
+        incipit = chapter.incipit() if total_parts == 1 else _incipit_of(paragraphs)
+        artifacts.write(out_dir, "paragraphs", {
+            "book": book,
+            "chapter_id": chapter_id,
+            "chapter_index": chapter.index,
+            "chapter_number": chapter.number,
+            "chapter_title": chapter.title,
+            "part": chapter.part,
+            "part_title": chapter.part_title,
+            "label": label,
+            "incipit": incipit,
+            "paragraphs": [
+                {"index": i, "text": text}
+                for i, text in enumerate(paragraphs, start=1)
+            ],
+        })
+
+        if total_parts > 1:
+            print(f"  part {part}/{total_parts}: {len(paragraphs)} paragraphs")
+        print("  tagging with spaCy…")
+        candidates = nlp.extract_candidates(paragraphs, known_forms=known_forms)
+        rows = [c.to_dict() for c in candidates]
+
+        artifacts.write(out_dir, "words", {
+            "book": book, "chapter_id": chapter_id, "label": label,
+            "words": rows,
+        })
+        print(f"  {len(rows)} distinct (lemma, part of speech) candidates")
+        print(f"  wrote {out_dir}/words.json")
+
+    if total_parts > 1:
+        print(f"\nnext: fcc level --chapter {chapter.chapter_id}p1  "
+              f"(…through p{total_parts})")
+    else:
+        print(f"\nnext: fcc level --chapter {args.chapter}")
     return 0
+
+
+def _incipit_of(paragraphs: list[str], limit: int = 200) -> str:
+    """Opening line of a split part, so each part identifies itself."""
+    if not paragraphs:
+        return ""
+    text = " ".join(paragraphs)[: limit * 2].strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0].rstrip(",;:") + "…"
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +381,183 @@ def cmd_build(args, cfg) -> int:
 # fcc mark-known / stats
 # ---------------------------------------------------------------------------
 
+def cmd_run(args, cfg) -> int:
+    """Build every chapter in one pass, then pack them into one .apkg.
+
+    Runs in a single process on purpose: spaCy and ~45MB of lexicons load once
+    instead of 59 times, and the seen-store threads through the loop so each
+    chapter only surfaces words no earlier chapter already taught.
+    """
+    epub = args.epub or cfg.get("epub")
+    if not epub:
+        return _fail("no EPUB given; pass --epub or set epub in flashcards.toml")
+
+    started = time.monotonic()
+    title, chapters = ingest.read_chapters(Path(epub))
+    book = args.book or cfg.get("book") or title
+    slug = _book_slug(book)
+    threshold = args.min_level or cfg.get("min_level", "B2")
+    model = args.model or cfg.get("model", llm.DEFAULT_MODEL)
+
+    if args.chapters:
+        wanted = {_normalise_spec(c) for c in args.chapters.split(",")}
+        chapters = [c for c in chapters if c.chapter_id in wanted]
+        if not chapters:
+            return _fail(f"no chapters matched {args.chapters!r}")
+
+    print(f"{book} — {len(chapters)} chapters, threshold {threshold}+")
+    print("loading spaCy and reference lexicons…")
+    known_forms = lexicon.known_forms()
+    known = {} if args.ignore_known else store.load()
+
+    # ---- stages 1 and 2, chapter by chapter -------------------------------
+    print("\nextracting and levelling…")
+    staged: list[dict] = []
+    for chapter in chapters:
+        out_dir = paths.chapter_dir(slug, chapter.chapter_id)
+        candidates = nlp.extract_candidates(
+            chapter.paragraphs, known_forms=known_forms)
+        rows = leveling.level_candidates(
+            [c.to_dict() for c in candidates], threshold=threshold,
+            known=known, include_unknown=args.include_unknown)
+
+        artifacts.write(out_dir, "paragraphs", {
+            "book": book, "chapter_id": chapter.chapter_id,
+            "chapter_index": chapter.index, "chapter_number": chapter.number,
+            "chapter_title": chapter.title, "part": chapter.part,
+            "part_title": chapter.part_title, "label": chapter.label,
+            "incipit": chapter.incipit(),
+            "paragraphs": [{"index": i, "text": t}
+                           for i, t in enumerate(chapter.paragraphs, start=1)],
+        })
+        artifacts.write(out_dir, "words_leveled", {
+            "book": book, "chapter_id": chapter.chapter_id,
+            "label": chapter.label, "threshold": threshold,
+            "summary": leveling.summarise(rows), "words": rows,
+        })
+
+        fresh = [r for r in rows
+                 if r["passes_threshold"] and not r["already_known"]]
+        # Reserve these now so a later chapter does not re-teach them.
+        for row in fresh:
+            known[f"{row['lemma']}|{row['pos']}"] = {"lemma": row["lemma"]}
+        staged.append({"chapter": chapter, "dir": out_dir, "rows": fresh})
+        print(f"  {chapter.chapter_id}  {len(chapter.paragraphs):4d} ¶  "
+              f"{len(rows):5d} words  {len(fresh):5d} new")
+
+    pool = [r for s in staged for r in s["rows"]]
+    print(f"\n{len(pool):,} distinct words at {threshold}+ across the book")
+
+    # ---- stage 3: Claude judges each word ---------------------------------
+    if not args.no_triage:
+        criteria = args.criteria or "exclude arcane vocabulary"
+        standing = config.standing_criteria(cfg)
+        print(f"\ntriage — {criteria!r}")
+        verdicts = triage.judge(
+            [triage.from_row(r) for r in pool],
+            backend=args.llm_backend, model=model, workers=args.workers,
+            extra_criteria=standing or None,
+            progress=lambda m: print(f"  {m}"))
+
+        kept_keys = set()
+        for stage in staged:
+            selection = triage.build_selection(stage["rows"], verdicts, criteria)
+            artifacts.write(stage["dir"], "selection", selection)
+            stage["rows"] = [r for r in stage["rows"]
+                             if verdicts.get(triage.from_row(r).key, {}).get("keep", True)]
+            kept_keys.update(f"{r['lemma']}|{r['pos']}" for r in stage["rows"])
+
+        decisions = [d for s in staged
+                     for d in triage.build_selection(s["rows"], verdicts, criteria)["decisions"]]
+        dropped = len(pool) - len(kept_keys)
+        print(f"  kept {len(kept_keys):,}  dropped {dropped:,} "
+              f"({100 * dropped // max(len(pool), 1)}%)")
+        _ = decisions
+
+    pool = [r for s in staged for r in s["rows"]]
+    print(f"{len(pool):,} words to card")
+
+    # ---- stage 4: glosses, senses, audio ----------------------------------
+    print("\nenriching…")
+    for row in pool:
+        entry = glosses.lookup(row["lemma"], row["pos"])
+        row.update(entry.to_dict())
+
+    if not args.no_senses:
+        items = [llm.Item(lemma=r["lemma"], pos=r["pos"],
+                          sentence=r.get("sentence", ""),
+                          candidates=r.get("glosses") or []) for r in pool]
+        senses = llm.resolve_senses(
+            items, backend=args.llm_backend, model=model,
+            workers=args.workers, progress=lambda m: print(f"  {m}"))
+        for row, item in zip(pool, items):
+            picked = senses.get(item.key) or {}
+            row["translation"] = picked.get("translation") or (
+                row.get("glosses") or [""])[0]
+            row["note"] = picked.get("note", "")
+    else:
+        for row in pool:
+            row["translation"] = (row.get("glosses") or [""])[0]
+            row["note"] = ""
+
+    if not args.no_audio:
+        found = audio.fetch_many(
+            pool, allow_live=not args.no_live_audio,
+            allow_tts=not args.no_tts, workers=args.audio_workers,
+            allow_download=args.download_audio,
+            progress=lambda m: print(f"{m}"))
+        native = sum(1 for r in pool if r.get("audio_path")
+                     and not r["audio_path"].endswith(".tts.mp3"))
+        print(f"  audio for {found:,}/{len(pool):,} words "
+              f"({native:,} native, {found - native:,} synthesised)")
+
+    # ---- stage 5: one package, plus per-chapter files ---------------------
+    print("\nbuilding decks…")
+    book_chapters = []
+    for stage in staged:
+        if not stage["rows"]:
+            continue
+        chapter = stage["chapter"]
+        artifacts.write(stage["dir"], "words_enriched", {
+            "book": book, "chapter_id": chapter.chapter_id,
+            "label": chapter.label, "threshold": threshold,
+            "criteria": args.criteria or "exclude arcane vocabulary",
+            "words": stage["rows"],
+        })
+        meta = deck.DeckMeta(
+            book=book, chapter_label=chapter.label,
+            chapter_id=chapter.chapter_id, incipit=chapter.incipit(),
+            paragraphs=len(chapter.paragraphs))
+        book_chapters.append((stage["rows"], meta))
+        if not args.no_per_chapter:
+            deck.build_deck(
+                stage["rows"], meta,
+                stage["dir"] / f"{slug}-ch{chapter.chapter_id}.apkg",
+                threshold=threshold, incipit_card=not args.no_incipit_card)
+
+    output = Path(args.output) if args.output else (
+        paths.WORK_DIR / slug / f"{slug}-complete.apkg")
+    result = deck.build_book(
+        book_chapters, output, threshold=threshold,
+        incipit_card=not args.no_incipit_card)
+
+    if not args.no_record:
+        recorded = store.load()
+        added = 0
+        for stage in staged:
+            added += store.record(recorded, stage["rows"], book,
+                                  stage["chapter"].chapter_id)
+        store.save(recorded)
+        print(f"  recorded {added:,} words as seen")
+
+    elapsed = time.monotonic() - started
+    print(f"\nbuilt {result['path']}")
+    print(f"  {result['decks']} chapter subdecks, {result['cards']:,} cards, "
+          f"{result['media_files']:,} audio files")
+    print(f"  {elapsed / 60:.1f} minutes")
+    return 0
+
+
 def cmd_mark_known(args, cfg) -> int:
     known = store.load()
     if args.forget:
@@ -400,6 +606,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("extract", help="EPUB -> candidate words")
     p.add_argument("--epub")
+    p.add_argument("--split-at", type=int, metavar="CHARS",
+                   help="split an oversized chapter into review-sized parts, "
+                        "addressed as 1.1p1, 1.1p2, …")
     common(p)
     p.set_defaults(func=cmd_extract)
 
@@ -432,6 +641,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-record", action="store_true",
                    help="do not add these words to the seen-words store")
     p.set_defaults(func=cmd_build)
+
+    p = sub.add_parser("run", help="build every chapter and pack them into one .apkg")
+    p.add_argument("--epub")
+    p.add_argument("--book")
+    p.add_argument("--chapters", help="comma-separated subset, e.g. '1.1,1.2'")
+    p.add_argument("--min-level", help="threshold, default B2")
+    p.add_argument("--criteria", help="what to keep or drop, e.g. "
+                                      "'exclude arcane vocabulary'")
+    p.add_argument("--no-triage", action="store_true",
+                   help="skip Claude's keep/drop judgement")
+    p.add_argument("--llm-backend", default="auto", choices=("auto",) + llm.BACKENDS)
+    p.add_argument("--model")
+    p.add_argument("--workers", type=int, default=llm.DEFAULT_WORKERS,
+                   help="concurrent LLM batches")
+    p.add_argument("--audio-workers", type=int, default=8)
+    p.add_argument("--include-unknown", action="store_true")
+    p.add_argument("--ignore-known", action="store_true")
+    p.add_argument("--no-senses", action="store_true")
+    p.add_argument("--no-audio", action="store_true")
+    p.add_argument("--no-live-audio", action="store_true")
+    p.add_argument("--no-tts", action="store_true",
+                   help="do not synthesise audio for words with no recording")
+    p.add_argument("--download-audio", action="store_true",
+                   help="try downloading native recordings. Off by default for "
+                        "whole-book runs: Wikimedia throttles bulk fetching hard "
+                        "(~83%% 429s here, regardless of pacing). Cached native "
+                        "audio is always used and always preferred.")
+    p.add_argument("--no-incipit-card", action="store_true")
+    p.add_argument("--no-per-chapter", action="store_true",
+                   help="only write the combined package")
+    p.add_argument("--no-record", action="store_true")
+    p.add_argument("--output")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("mark-known", help="record words as already known")
     p.add_argument("words", nargs="+")

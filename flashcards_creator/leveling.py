@@ -118,11 +118,20 @@ def level_for(lemma: str, pos: str) -> Level:
         return Level(best["level"], "flelex_lemma", 0.8, modern)
 
     # Tier 3: not in FLELex, estimate from modern book frequency, with a floor
-    # -- absence from FLELex already means the word is off-curriculum.
+    # -- absence from FLELex usually means the word is off-curriculum.
+    #
+    # "Usually", not "always": FLELex omits some very common words too, and
+    # forcing those up to the floor injects basic vocabulary into an advanced
+    # deck. `fois` (1140 per million) and `mois` (305) are both off-list, and
+    # neither is B2 by any reading. High frequency outranks the floor, at the
+    # point where the calibration bins say beginner levels dominate.
     level, agreement = estimate_from_frequency(modern)
     if level != UNKNOWN:
-        floor = lexicon.freq_bands().get("off_list_floor", "B2")
-        if floor in LEVEL_INDEX and LEVEL_INDEX[level] < LEVEL_INDEX[floor]:
+        bands = lexicon.freq_bands()
+        floor = bands.get("off_list_floor", "B2")
+        ceiling = bands.get("off_list_floor_max_freq", 30.0)
+        below_floor = floor in LEVEL_INDEX and LEVEL_INDEX[level] < LEVEL_INDEX[floor]
+        if below_floor and (modern or 0) < ceiling:
             level = floor
         return Level(level, "freq_estimate", agreement, modern)
 

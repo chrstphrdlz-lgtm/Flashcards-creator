@@ -26,6 +26,8 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -39,6 +41,10 @@ DEFAULT_MODEL = "claude-sonnet-5"
 # Batched rather than one call per word: measured at 50 words per request,
 # which returned valid JSON for all of them in about 11 seconds.
 BATCH_SIZE = 50
+
+# Concurrent batches. Each one is a subprocess or HTTP call that spends its
+# time waiting, so a handful of threads is plenty.
+DEFAULT_WORKERS = 4
 
 SYSTEM_PROMPT = (
     "You are a French-English lexicographer preparing Anki flashcards for an "
@@ -255,6 +261,7 @@ def resolve_senses(
     model: str = DEFAULT_MODEL,
     pending_path: Path | None = None,
     progress: Callable[[str], None] | None = None,
+    workers: int = DEFAULT_WORKERS,
 ) -> dict[str, dict]:
     """Return {item.key: {"translation", "note", "source"}} for every item.
 
@@ -296,17 +303,11 @@ def resolve_senses(
         _write_pending(path, todo)
         raise PendingSenses(path, len(todo))
 
-    runner = _run_claude_cli if chosen == "claude-cli" else _run_api
-
-    for start in range(0, len(todo), BATCH_SIZE):
-        batch = todo[start:start + BATCH_SIZE]
-        say(f"  batch {start // BATCH_SIZE + 1}: {len(batch)} words")
-        try:
-            raw = (runner(_build_prompt(batch), model) if chosen == "claude-cli"
-                   else runner(_build_prompt(batch), model))
-            results = parse_response(raw)
-        except LlmError as exc:
-            say(f"  batch failed ({exc}); falling back to dictionary order")
+    batches = [todo[i:i + BATCH_SIZE] for i in range(0, len(todo), BATCH_SIZE)]
+    for batch, results in run_batches(
+            batches, _build_prompt, chosen, model,
+            workers=workers, progress=say):
+        if results is None:
             for item in batch:
                 out[item.key] = _fallback(item)
             continue
@@ -327,6 +328,52 @@ def resolve_senses(
 
     save_cache(cache)
     return out
+
+
+def run_batches(
+    batches: list[list[Any]],
+    prompt_fn: Callable[[list[Any]], str],
+    backend: str,
+    model: str,
+    workers: int = DEFAULT_WORKERS,
+    progress: Callable[[str], None] | None = None,
+) -> list[tuple[list[Any], list[dict] | None]]:
+    """Run prompt batches concurrently, yielding (batch, parsed results).
+
+    ``None`` results mean that batch failed; the caller decides how to degrade,
+    which keeps one bad batch from taking down a whole run.
+
+    Concurrency matters at book scale: the 108 batches a full book needs take
+    around twenty minutes one at a time. Each call is a subprocess or an HTTP
+    request, so threads are enough -- the work is entirely spent waiting.
+    """
+    say = progress or (lambda _msg: None)
+    runner = _run_claude_cli if backend == "claude-cli" else _run_api
+    total = len(batches)
+    done = 0
+    lock = threading.Lock()
+
+    def work(index: int, batch: list[Any]):
+        nonlocal done
+        try:
+            results = parse_response(runner(prompt_fn(batch), model))
+        except LlmError as exc:
+            with lock:
+                done += 1
+                say(f"  batch {index + 1}/{total} failed ({exc})")
+            return batch, None
+        with lock:
+            done += 1
+            if done % 10 == 0 or done == total:
+                say(f"  {done}/{total} batches")
+        return batch, results
+
+    if workers <= 1 or total == 1:
+        return [work(i, b) for i, b in enumerate(batches)]
+
+    with ThreadPoolExecutor(max_workers=min(workers, total)) as pool:
+        futures = [pool.submit(work, i, b) for i, b in enumerate(batches)]
+        return [f.result() for f in futures]
 
 
 def _fallback(item: Item) -> dict:

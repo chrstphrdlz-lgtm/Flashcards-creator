@@ -177,7 +177,77 @@ def build_deck(
     threshold: str = "B2",
     incipit_card: bool = True,
 ) -> dict[str, Any]:
-    """Assemble the .apkg. Returns a summary of what went into it."""
+    """Assemble a one-chapter .apkg. Returns a summary of what went into it."""
+    anki_deck, media, count = compose_deck(rows, meta, threshold, incipit_card)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    package = genanki.Package(anki_deck)
+    package.media_files = media
+    package.write_to_file(str(output))
+
+    return {
+        "deck": anki_deck.name,
+        "path": str(output),
+        "cards": count,
+        "incipit_card": incipit_card,
+        "media_files": len(media),
+        "paragraphs": len({r.get("first_paragraph") for r in rows}),
+    }
+
+
+def build_book(
+    chapters: list[tuple[list[dict], DeckMeta]],
+    output: Path,
+    threshold: str = "B2",
+    incipit_card: bool = True,
+) -> dict[str, Any]:
+    """Pack every chapter into one .apkg as a tree of subdecks.
+
+    genanki.Package takes a list of decks, and Anki builds the hierarchy from
+    the `::` in each name -- so 59 chapters import in a single step and land
+    under one parent rather than as 59 separate files to shepherd.
+    """
+    if not chapters:
+        raise DeckError("no chapters to build")
+
+    decks, media, total = [], [], 0
+    for rows, meta in chapters:
+        if not rows:
+            continue
+        anki_deck, chapter_media, count = compose_deck(
+            rows, meta, threshold, incipit_card)
+        decks.append(anki_deck)
+        media.extend(chapter_media)
+        total += count
+
+    if not decks:
+        raise DeckError("every chapter was empty after selection")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    package = genanki.Package(decks)
+    # One file may be shared by several chapters only if a word repeated, which
+    # the seen-store prevents -- but dedupe anyway so the archive stays clean.
+    package.media_files = sorted(set(media))
+    package.write_to_file(str(output))
+
+    return {
+        "path": str(output),
+        "decks": len(decks),
+        "cards": total,
+        "media_files": len(package.media_files),
+    }
+
+
+def compose_deck(
+    rows: list[dict],
+    meta: DeckMeta,
+    threshold: str = "B2",
+    incipit_card: bool = True,
+) -> tuple[genanki.Deck, list[str], int]:
+    """Build one chapter's deck in memory, without writing it.
+
+    Split out from build_deck so a whole book can be packaged in one archive.
+    """
     if not rows:
         raise DeckError(
             "no words to build a deck from. Either the chapter had nothing "
@@ -254,16 +324,4 @@ def build_deck(
             tags=tags,
         ))
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    package = genanki.Package(anki_deck)
-    package.media_files = media
-    package.write_to_file(str(output))
-
-    return {
-        "deck": name,
-        "path": str(output),
-        "cards": len(ordered),
-        "incipit_card": incipit_card,
-        "media_files": len(media),
-        "paragraphs": len({r.get("first_paragraph") for r in ordered}),
-    }
+    return anki_deck, media, len(ordered)

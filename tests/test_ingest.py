@@ -104,3 +104,24 @@ def test_split_at_breaks_on_paragraph_bounds(book):
     # No paragraph may be lost or split in half.
     assert sum(len(b) for b in batches) == len(chapter.paragraphs)
     assert [p for b in batches for p in b] == chapter.paragraphs
+
+
+def test_split_parts_are_individually_identifiable(book):
+    """Split parts become separate decks, so each needs its own opening line."""
+    from flashcards_creator.cli import _incipit_of
+
+    _, chapters = book
+    chapter = ingest.select_chapter(chapters, "1.1")
+    batches = ingest.split_paragraphs(chapter, split_at=10000)
+    incipits = [_incipit_of(b) for b in batches]
+
+    assert len(set(incipits)) == len(incipits), "two parts share an opening"
+    assert incipits[0].startswith("Il y a aujourd’hui")
+    assert all(len(i) <= 201 for i in incipits)
+
+
+def test_no_split_returns_the_chapter_whole(book):
+    _, chapters = book
+    chapter = ingest.select_chapter(chapters, "1.6")
+    assert ingest.split_paragraphs(chapter, None) == [chapter.paragraphs]
+    assert ingest.split_paragraphs(chapter, 0) == [chapter.paragraphs]

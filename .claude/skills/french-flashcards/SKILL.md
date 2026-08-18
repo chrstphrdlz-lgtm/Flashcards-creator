@@ -34,6 +34,28 @@ through.
 `fcc chapters` lists them. Address a chapter either as `1.6` (Livre I,
 chapter VI) or by flat position `6` — both work at every stage.
 
+## Whole books
+
+For more chapters than a conversation can curate one at a time:
+
+```bash
+fcc run --criteria "exclude arcane vocabulary"
+fcc run --chapters 1.1,1.2 --criteria "..."   # a subset
+```
+
+`fcc run` does every stage for every chapter in a single process (spaCy and the
+lexicons load once, not once per chapter), and uses **triage** for stage 3:
+Claude judges each word keep/drop against `--criteria` plus any standing
+criteria in `flashcards.toml`, writing the same `selection.json` with a reason
+per word.
+
+It writes one combined `.apkg` containing every chapter as a subdeck, plus
+per-chapter files. Expect tens of minutes for a novel; every stage is cached,
+so an interrupted run resumes cheaply.
+
+Report the totals and **show the user a sample of what was dropped** — a
+systematic misjudgement is invisible in the counts alone.
+
 ## Stage 3: selection
 
 This is the stage that needs you. Read `words_leveled.json`, decide what
