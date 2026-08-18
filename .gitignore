@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Fetched reference data, caches, generated audio. Never committed:
+# FLELex is CC BY-NC-SA, the Kaikki dump is ~573MB. See CREDITS.md.
+data/
+
+# Per-chapter pipeline artifacts and generated decks
+work/
+
+# Source books
+books/
+*.epub
