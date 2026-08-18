@@ -1,0 +1,13 @@
+# Defaults for this project. Anything here can be overridden per command.
+
+[book_settings]
+book = "Notre-Dame de Paris"
+epub = "books/notre-dame-de-paris.epub"
+min_level = "B2"
+model = "claude-sonnet-5"
+
+[selection]
+# Standing preferences applied to every chapter, alongside whatever you ask
+# for in the moment. Edit freely.
+standing_criteria = [
+]
