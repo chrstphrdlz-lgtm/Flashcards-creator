@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -355,18 +356,28 @@ def run_batches(
 
     def work(index: int, batch: list[Any]):
         nonlocal done
-        try:
-            results = parse_response(runner(prompt_fn(batch), model))
-        except LlmError as exc:
+        last: Exception | None = None
+        # One retry: batch failures observed in practice are transient (the CLI
+        # occasionally returns an empty error envelope), and a whole batch of
+        # words falling back is a real loss of quality.
+        for attempt in range(2):
+            try:
+                results = parse_response(runner(prompt_fn(batch), model))
+            except LlmError as exc:
+                last = exc
+                if attempt == 0:
+                    time.sleep(2)
+                continue
             with lock:
                 done += 1
-                say(f"  batch {index + 1}/{total} failed ({exc})")
-            return batch, None
+                if done % 10 == 0 or done == total:
+                    say(f"  {done}/{total} batches")
+            return batch, results
+
         with lock:
             done += 1
-            if done % 10 == 0 or done == total:
-                say(f"  {done}/{total} batches")
-        return batch, results
+            say(f"  batch {index + 1}/{total} failed twice ({last})")
+        return batch, None
 
     if workers <= 1 or total == 1:
         return [work(i, b) for i, b in enumerate(batches)]
