@@ -467,12 +467,21 @@ def cmd_run(args, cfg) -> int:
                              if verdicts.get(triage.from_row(r).key, {}).get("keep", True)]
             kept_keys.update(f"{r['lemma']}|{r['pos']}" for r in stage["rows"])
 
-        decisions = [d for s in staged
-                     for d in triage.build_selection(s["rows"], verdicts, criteria)["decisions"]]
         dropped = len(pool) - len(kept_keys)
         print(f"  kept {len(kept_keys):,}  dropped {dropped:,} "
               f"({100 * dropped // max(len(pool), 1)}%)")
-        _ = decisions
+
+        # A failed batch keeps its words rather than losing them, which is the
+        # right call -- but it means an unjudged word looks exactly like an
+        # approved one in the totals. Say so loudly: a run that quietly admits
+        # a quarter of the deck unreviewed should never look like a clean one.
+        unjudged = sum(1 for v in verdicts.values() if v.get("source") == "error")
+        if unjudged:
+            print(f"  WARNING: {unjudged:,} words were kept without being judged "
+                  f"({100 * unjudged // max(len(pool), 1)}% of the deck) because "
+                  f"their batch failed.\n"
+                  f"           Re-run the same command to judge just those -- "
+                  f"failures are not cached.")
 
     pool = [r for s in staged for r in s["rows"]]
     print(f"{len(pool):,} words to card")
