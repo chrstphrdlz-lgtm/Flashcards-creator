@@ -139,6 +139,36 @@ def test_a_failed_batch_degrades_instead_of_aborting(monkeypatch):
     assert results[item().key]["translation"] == "book"
 
 
+def test_results_are_cached_before_the_run_finishes(monkeypatch, tmp_path):
+    """An interrupted run must keep its work.
+
+    A whole book's worth of translations was lost once to a single save at the
+    very end, so the cache is now flushed while batches are still going.
+    """
+    cache_file = tmp_path / "llm_cache.json"
+    monkeypatch.setattr(llm.paths, "LLM_CACHE", cache_file)
+    monkeypatch.setattr(llm, "BATCH_SIZE", 1)
+    monkeypatch.setattr(llm, "CACHE_EVERY", 1)
+
+    saves = []
+    real_save = llm.save_cache
+
+    def counting_save(cache, path=None):
+        saves.append(len(cache))
+        real_save(cache, cache_file)
+
+    monkeypatch.setattr(llm, "save_cache", counting_save)
+    monkeypatch.setattr(llm, "_run_claude_cli",
+                        lambda *a, **k: '[{"id": 0, "translation": "x"}]')
+
+    items = [item(lemma=f"mot{i}") for i in range(4)]
+    llm.resolve_senses(items, backend="claude-cli", workers=1)
+
+    # More than one save means work was persisted mid-run, not only at the end.
+    assert len(saves) > 1
+    assert json.loads(cache_file.read_text(encoding="utf-8"))
+
+
 def test_a_missing_result_for_one_word_falls_back_only_for_that_word(monkeypatch):
     monkeypatch.setattr(llm, "load_cache", lambda *a, **k: {})
     monkeypatch.setattr(llm, "save_cache", lambda *a, **k: None)

@@ -163,8 +163,13 @@ def judge(
                     f"{json.dumps([c.payload(i) for i, c in enumerate(batch)], ensure_ascii=False)}")
 
     batches = [todo[i:i + BATCH_SIZE] for i in range(0, len(todo), BATCH_SIZE)]
+    completed = 0
     for batch, results in llm.run_batches(
             batches, prompt_fn, chosen, model, workers=workers, progress=say):
+        completed += 1
+        # Persist as we go, so an interrupted run keeps its verdicts.
+        if completed % llm.CACHE_EVERY == 0:
+            llm.save_cache(cache)
         if results is None:
             for candidate in batch:
                 out[candidate.key] = {

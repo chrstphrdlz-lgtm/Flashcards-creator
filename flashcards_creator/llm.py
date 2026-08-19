@@ -28,10 +28,10 @@ import shutil
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from . import paths
 
@@ -46,6 +46,10 @@ BATCH_SIZE = 50
 # Concurrent batches. Each one is a subprocess or HTTP call that spends its
 # time waiting, so a handful of threads is plenty.
 DEFAULT_WORKERS = 4
+
+# Flush the cache every this many batches, so an interrupted run keeps most of
+# its work instead of starting over.
+CACHE_EVERY = 5
 
 SYSTEM_PROMPT = (
     "You are a French-English lexicographer preparing Anki flashcards for an "
@@ -305,6 +309,7 @@ def resolve_senses(
         raise PendingSenses(path, len(todo))
 
     batches = [todo[i:i + BATCH_SIZE] for i in range(0, len(todo), BATCH_SIZE)]
+    completed = 0
     for batch, results in run_batches(
             batches, _build_prompt, chosen, model,
             workers=workers, progress=say):
@@ -327,6 +332,13 @@ def resolve_senses(
             out[item.key] = entry
             cache[item.key] = entry
 
+        # Persist as we go. Saving only at the end means an interrupted run
+        # throws away everything it did, which is precisely what happened to a
+        # book's worth of translations once.
+        completed += 1
+        if completed % CACHE_EVERY == 0:
+            save_cache(cache)
+
     save_cache(cache)
     return out
 
@@ -338,7 +350,7 @@ def run_batches(
     model: str,
     workers: int = DEFAULT_WORKERS,
     progress: Callable[[str], None] | None = None,
-) -> list[tuple[list[Any], list[dict] | None]]:
+) -> Iterator[tuple[list[Any], list[dict] | None]]:
     """Run prompt batches concurrently, yielding (batch, parsed results).
 
     ``None`` results mean that batch failed; the caller decides how to degrade,
@@ -347,6 +359,11 @@ def run_batches(
     Concurrency matters at book scale: the 108 batches a full book needs take
     around twenty minutes one at a time. Each call is a subprocess or an HTTP
     request, so threads are enough -- the work is entirely spent waiting.
+
+    Results are yielded **as they complete**, not collected first, so callers
+    can persist to the cache while the run is still going. A whole book's worth
+    of sense-picking was lost once to a process that ended before its single
+    save at the end.
     """
     say = progress or (lambda _msg: None)
     runner = _run_claude_cli if backend == "claude-cli" else _run_api
@@ -380,11 +397,14 @@ def run_batches(
         return batch, None
 
     if workers <= 1 or total == 1:
-        return [work(i, b) for i, b in enumerate(batches)]
+        for index, batch in enumerate(batches):
+            yield work(index, batch)
+        return
 
     with ThreadPoolExecutor(max_workers=min(workers, total)) as pool:
         futures = [pool.submit(work, i, b) for i, b in enumerate(batches)]
-        return [f.result() for f in futures]
+        for future in as_completed(futures):
+            yield future.result()
 
 
 def _fallback(item: Item) -> dict:
