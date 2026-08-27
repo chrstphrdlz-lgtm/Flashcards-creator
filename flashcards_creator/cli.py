@@ -550,6 +550,31 @@ def cmd_run(args, cfg) -> int:
         book_chapters, output, threshold=threshold,
         incipit_card=not args.no_incipit_card)
 
+    # A whole novel's audio makes one archive awkward to move around -- this
+    # book's is 42MB. Bundling by part keeps every file small while leaving the
+    # deck names untouched, so the bundles merge back into one tree on import.
+    if args.bundle_by == "part":
+        groups: dict[str, list] = {}
+        for stage in staged:
+            if not stage["rows"]:
+                continue
+            part = stage["chapter"].part
+            key = f"{part:02d}" if part is not None else "00"
+            groups.setdefault(key, []).append(
+                (stage["rows"],
+                 next(m for r, m in book_chapters if r is stage["rows"])))
+
+        bundle_dir = output.parent / "bundles"
+        print(f"\nbundling by part into {bundle_dir}/")
+        for key in sorted(groups):
+            dest = bundle_dir / f"{slug}-livre-{key}.apkg"
+            bundle = deck.build_book(
+                groups[key], dest, threshold=threshold,
+                incipit_card=not args.no_incipit_card)
+            print(f"  livre {key}: {bundle['decks']:2d} chapters, "
+                  f"{bundle['cards']:4d} cards, "
+                  f"{dest.stat().st_size / 1e6:5.1f} MB")
+
     if not args.no_record:
         recorded = store.load()
         added = 0
@@ -680,6 +705,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-incipit-card", action="store_true")
     p.add_argument("--no-per-chapter", action="store_true",
                    help="only write the combined package")
+    p.add_argument("--bundle-by", choices=("none", "part"), default="none",
+                   help="also write one archive per part/Livre. The combined "
+                        "file for a novel can be too large to move around; "
+                        "bundles keep the same deck names, so importing all of "
+                        "them rebuilds the identical tree.")
     p.add_argument("--no-record", action="store_true")
     p.add_argument("--output")
     p.add_argument("--force", action="store_true")
