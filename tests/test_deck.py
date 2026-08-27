@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import zipfile
 
@@ -177,6 +178,56 @@ def test_rebuilding_keeps_the_same_deck_and_note_identity(tmp_path):
 
     name = deck.deck_name("Notre-Dame de Paris", "01.06")
     assert deck._stable_id(name) == deck._stable_id(name)
+
+
+def test_build_book_packs_many_chapters_into_one_archive(tmp_path):
+    out = tmp_path / "book.apkg"
+    result = deck.build_book([
+        (rows(), meta(chapter_id="01.06", label="Livre I, ch. VI",
+                      incipit="Nous sommes ravis…")),
+        (rows(), meta(chapter_id="02.01", label="Livre II, ch. I",
+                      incipit="Les cloches se turent…")),
+    ], out)
+
+    assert result["decks"] == 2
+    assert result["cards"] == 4
+    _, payload, _ = read_package(out)
+    notes, decks_json = load_notes(tmp_path, payload)
+    # Both chapters, in one archive, under one parent.
+    assert "Ch 01.06" in decks_json and "Ch 02.01" in decks_json
+    assert len(notes) == 6  # 2 words + 1 incipit card, twice
+
+
+def test_bundles_carry_the_same_deck_names_as_the_whole_book(tmp_path):
+    """Bundles exist only to make files smaller, not to change the decks.
+
+    Importing every bundle must rebuild the same tree the single archive would,
+    which only holds if the deck names are identical either way.
+    """
+    whole = tmp_path / "whole.apkg"
+    part_a = tmp_path / "a.apkg"
+    part_b = tmp_path / "b.apkg"
+
+    one = (rows(), meta(chapter_id="01.06", label="Livre I, ch. VI"))
+    two = (rows(), meta(chapter_id="02.01", label="Livre II, ch. I"))
+    deck.build_book([one, two], whole)
+    deck.build_book([one], part_a)
+    deck.build_book([two], part_b)
+
+    def deck_names(path, workdir):
+        workdir.mkdir()
+        _, payload, _ = read_package(path)
+        _, decks_json = load_notes(workdir, payload)
+        return {d["name"] for d in json.loads(decks_json).values()
+                if "::Ch " in d.get("name", "")}
+
+    combined = deck_names(part_a, tmp_path / "a") | deck_names(part_b, tmp_path / "b")
+    assert combined == deck_names(whole, tmp_path / "w")
+
+
+def test_build_book_rejects_an_empty_book(tmp_path):
+    with pytest.raises(deck.DeckError, match="no chapters"):
+        deck.build_book([], tmp_path / "empty.apkg")
 
 
 def test_empty_selection_is_a_clear_error(tmp_path):
